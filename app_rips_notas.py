@@ -165,7 +165,8 @@ def generar_excel_servicios(nota: Dict[str, Any]) -> BytesIO:
         )
     df = pd.DataFrame(filas)
     buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+    # 👇 Aquí el cambio: usamos openpyxl para escribir el .xlsx
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="servicios")
     buffer.seek(0)
     return buffer
