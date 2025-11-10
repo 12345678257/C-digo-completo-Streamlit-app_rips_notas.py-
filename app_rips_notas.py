@@ -135,25 +135,54 @@ def generar_resumen_usuarios(nota: Dict[str, Any]) -> pd.DataFrame:
 
 
 # ==========================
-# Excel / CSV masivo
+# Plantilla masiva por servicio
 # ==========================
 
-def generar_excel_servicios(nota: Dict[str, Any]) -> Tuple[BytesIO, str, str]:
+def _extraer_filas_servicios(base_doc: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Genera plantilla para edición masiva.
-    Si hay motor de Excel disponible, genera .xlsx; si no, genera .csv.
-    Retorna (buffer, extension, mime_type).
+    Convierte la estructura JSON en filas planas, una fila por servicio:
+    - idx_usuario, tipo_servicio, idx_item
+    - identificacion del usuario
+    - datos básicos del servicio
+    - vrServicio_factura (referencia) y vrServicio_nota (a diligenciar)
     """
     filas: List[Dict[str, Any]] = []
-    for idx, u in enumerate(nota.get("usuarios", [])):
-        filas.append(
-            {
-                "index": idx,
-                "tipoDocumentoIdentificacion": u.get("tipoDocumentoIdentificacion"),
-                "numDocumentoIdentificacion": u.get("numDocumentoIdentificacion"),
-                "servicios_json": json.dumps(u.get("servicios", {}), ensure_ascii=False),
-            }
-        )
+    for idx_u, u in enumerate(base_doc.get("usuarios", [])):
+        servicios = u.get("servicios") or {}
+        if not isinstance(servicios, dict) or not servicios:
+            continue
+        for tipo_serv, lista in servicios.items():
+            if not isinstance(lista, list):
+                continue
+            for idx_item, item in enumerate(lista):
+                filas.append(
+                    {
+                        "idx_usuario": idx_u,
+                        "tipoDocumentoIdentificacion": u.get("tipoDocumentoIdentificacion"),
+                        "numDocumentoIdentificacion": u.get("numDocumentoIdentificacion"),
+                        "tipo_servicio": tipo_serv,
+                        "idx_item": idx_item,
+                        "codPrestador": item.get("codPrestador"),
+                        "fechaInicioAtencion": item.get("fechaInicioAtencion"),
+                        "codConsulta": item.get("codConsulta"),
+                        "codServicio": item.get("codServicio"),
+                        "vrServicio_factura": item.get("vrServicio"),
+                        "vrServicio_nota": None,
+                        "valorPagoModerador": item.get("valorPagoModerador"),
+                    }
+                )
+    return filas
+
+
+def generar_plantilla_servicios(nota: Dict[str, Any], factura: Optional[Dict[str, Any]]) -> Tuple[BytesIO, str, str]:
+    """
+    Genera plantilla para edición masiva de servicios.
+    Si hay factura, usa la factura como base (valores reales de la prestación).
+    Si no hay factura, usa la nota actual.
+    Retorna (buffer, extension, mime_type).
+    """
+    base_doc = factura if factura is not None else nota
+    filas = _extraer_filas_servicios(base_doc)
     df = pd.DataFrame(filas)
     buffer = BytesIO()
     ext = "xlsx"
@@ -163,7 +192,6 @@ def generar_excel_servicios(nota: Dict[str, Any]) -> Tuple[BytesIO, str, str]:
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="servicios")
     except (ModuleNotFoundError, ImportError):
-        # Fallback a CSV para evitar errores cuando no hay motor de Excel
         buffer = BytesIO()
         df.to_csv(buffer, index=False)
         ext = "csv"
@@ -173,53 +201,117 @@ def generar_excel_servicios(nota: Dict[str, Any]) -> Tuple[BytesIO, str, str]:
     return buffer, ext, mime
 
 
-def aplicar_excel_servicios(nota: Dict[str, Any], archivo_excel) -> Tuple[Dict[str, Any], List[str]]:
+def aplicar_plantilla_servicios(
+    nota: Dict[str, Any],
+    factura: Optional[Dict[str, Any]],
+    archivo,
+) -> Tuple[Dict[str, Any], List[str]]:
     """
-    Aplica los cambios de servicios contenidos en un archivo de plantilla.
-    Soporta .xlsx (si hay motor instalado) y .csv.
-    Espera las columnas: index, servicios_json.
+    Aplica los cambios de vrServicio_nota contenidos en una plantilla.
+    Si la estructura de servicios no existe en la nota, se toma de la factura.
+    Soporta archivos .xlsx (si hay motor) y .csv.
     """
     errores: List[str] = []
     try:
-        nombre = getattr(archivo_excel, "name", "") or ""
+        nombre = getattr(archivo, "name", "") or ""
         if nombre.lower().endswith(".csv"):
-            df = pd.read_csv(archivo_excel)
+            df = pd.read_csv(archivo)
         else:
-            df = pd.read_excel(archivo_excel)
+            df = pd.read_excel(archivo)
     except Exception as exc:
         errores.append(f"No se pudo leer el archivo (xlsx/csv): {exc}")
         return nota, errores
 
-    if "index" not in df.columns or "servicios_json" not in df.columns:
-        errores.append("El archivo debe contener las columnas 'index' y 'servicios_json'.")
-        return nota, errores
+    obligatorias = ["idx_usuario", "tipo_servicio", "idx_item", "vrServicio_nota"]
+    for col in obligatorias:
+        if col not in df.columns:
+            errores.append(f"Falta columna obligatoria '{col}' en la plantilla.")
+            return nota, errores
 
-    usuarios = nota.get("usuarios", [])
+    usuarios_nota = nota.get("usuarios", [])
+    usuarios_fac = factura.get("usuarios", []) if factura else []
 
     for _, fila in df.iterrows():
         try:
-            idx = int(fila["index"])
+            idx_u = int(fila["idx_usuario"])
         except Exception:
-            errores.append(f"Índice inválido en fila: {fila.get('index')}")
+            errores.append(f"Índice de usuario inválido: {fila.get('idx_usuario')}")
             continue
 
-        if not (0 <= idx < len(usuarios)):
-            errores.append(f"Índice fuera de rango en fila: {idx}")
+        tipo_serv = str(fila["tipo_servicio"])
+        try:
+            idx_item = int(fila["idx_item"])
+        except Exception:
+            errores.append(f"Índice de ítem inválido para usuario {idx_u}: {fila.get('idx_item')}")
             continue
 
-        servicios_str = fila.get("servicios_json")
-        if pd.isna(servicios_str):
+        vr_nota = fila["vrServicio_nota"]
+        if pd.isna(vr_nota):
+            # si no diligenciaron nada, no tocamos ese servicio
             continue
+
+        if not (0 <= idx_u < len(usuarios_nota)):
+            errores.append(f"Índice de usuario {idx_u} fuera de rango.")
+            continue
+
+        usuario_nota = usuarios_nota[idx_u]
+        servicios_nota = usuario_nota.get("servicios")
+        if not isinstance(servicios_nota, dict):
+            servicios_nota = {}
+            usuario_nota["servicios"] = servicios_nota
+
+        lista = servicios_nota.get(tipo_serv)
+
+        # Si la lista o la posición no existen en la nota, intentamos copiarlas desde la factura.
+        if not (isinstance(lista, list) and idx_item < len(lista)):
+            if factura is None:
+                errores.append(
+                    f"No existe estructura de servicios para usuario {idx_u}, "
+                    f"tipo '{tipo_serv}', ítem {idx_item} y no hay factura cargada."
+                )
+                continue
+            if not (0 <= idx_u < len(usuarios_fac)):
+                errores.append(
+                    f"No se encontró el usuario {idx_u} en la factura para crear la estructura de servicios."
+                )
+                continue
+            usuario_fac = usuarios_fac[idx_u]
+            servicios_fac = usuario_fac.get("servicios", {})
+            lista_fac = servicios_fac.get(tipo_serv)
+            if not (isinstance(lista_fac, list) and idx_item < len(lista_fac)):
+                errores.append(
+                    f"No se encontró línea base en factura para usuario {idx_u}, "
+                    f"tipo '{tipo_serv}', ítem {idx_item}."
+                )
+                continue
+
+            item_base = copy.deepcopy(lista_fac[idx_item])
+            if not isinstance(lista, list):
+                lista = []
+            while len(lista) <= idx_item:
+                lista.append({})
+            lista[idx_item] = item_base
+            servicios_nota[tipo_serv] = lista
+
+        lista = servicios_nota.get(tipo_serv, [])
+        item_nota = lista[idx_item]
 
         try:
-            servicios_nuevos = json.loads(servicios_str)
-        except Exception as exc:
-            errores.append(f"JSON inválido en fila índice {idx}: {exc}")
+            valor_nota = float(vr_nota)
+        except Exception:
+            errores.append(
+                f"Valor de vrServicio_nota inválido para usuario {idx_u}, "
+                f"tipo '{tipo_serv}', ítem {idx_item}: {vr_nota}"
+            )
             continue
 
-        usuarios[idx]["servicios"] = servicios_nuevos
+        item_nota["vrServicio"] = valor_nota
+        lista[idx_item] = item_nota
+        servicios_nota[tipo_serv] = lista
+        usuario_nota["servicios"] = servicios_nota
+        usuarios_nota[idx_u] = usuario_nota
 
-    nota["usuarios"] = usuarios
+    nota["usuarios"] = usuarios_nota
     return nota, errores
 
 
@@ -303,7 +395,7 @@ def main():
     st.write(
         "Cargue la **factura (JSON completo)** y la **nota/crédito o archivo RIPS incompleto** en JSON. "
         "La aplicación le permitirá copiar los servicios faltantes, editar manualmente, "
-        "hacer ajustes masivos por Excel/CSV y descargar el resultado en JSON y XML."
+        "hacer ajustes masivos por plantilla (Excel/CSV) y descargar el resultado en JSON y XML."
     )
 
     st.sidebar.header("1️⃣ Cargar archivos")
@@ -314,10 +406,10 @@ def main():
     nota_file = st.sidebar.file_uploader(
         "JSON a corregir (Nota crédito / RIPS)", type=["json"], key="nota_uploader"
     )
-    excel_file = st.sidebar.file_uploader(
+    plantilla_file = st.sidebar.file_uploader(
         "Plantilla con servicios actualizados (xlsx o csv, opcional)",
         type=["xlsx", "csv"],
-        key="excel_uploader",
+        key="plantilla_uploader",
     )
 
     if "factura_data" not in st.session_state:
@@ -391,12 +483,13 @@ def main():
             else:
                 st.error(
                     "Hay usuarios con 'servicios' vacío o sin listas con ítems. "
-                    "Puede rellenarlos automáticamente desde la factura o editar manualmente."
+                    "Puede rellenarlos automáticamente desde la factura, "
+                    "editar un usuario puntual o usar la plantilla masiva."
                 )
 
     # 3. Copiar servicios desde factura
     st.markdown("---")
-    st.subheader("3️⃣ Rellenar servicios desde JSON de referencia")
+    st.subheader("3️⃣ Rellenar servicios desde JSON de referencia (opcional)")
 
     if not factura_data:
         st.info("Para copiar servicios automáticamente, cargue primero el JSON de la factura.")
@@ -443,7 +536,7 @@ def main():
 
     # 4. Edición individual
     st.markdown("---")
-    st.subheader("4️⃣ Edición individual de servicios")
+    st.subheader("4️⃣ Edición individual de servicios (JSON crudo)")
 
     usuarios = nota_data.get("usuarios", [])
     if not usuarios:
@@ -467,7 +560,7 @@ def main():
         servicios_editados = st.text_area(
             "Edite el JSON de `servicios` para este usuario (estructura dict con listas).",
             value=servicios_actuales_str,
-            height=300,
+            height=260,
             key=f"servicios_usuario_{idx_sel}",
         )
 
@@ -483,25 +576,43 @@ def main():
                 st.session_state["nota_data"] = nota_data
                 st.success("Servicios actualizados correctamente para este usuario.")
 
-    # 5. Masivo Excel / CSV
+    # 5. Masivo con plantilla
     st.markdown("---")
-    st.subheader("5️⃣ Edición masiva por Excel/CSV")
+    st.subheader("5️⃣ Edición masiva con plantilla (valor de la nota por servicio)")
+
+    st.markdown(
+        """
+        **Cómo funciona la plantilla:**
+
+        - Cada fila representa **un servicio** de un usuario.
+        - Campos clave:
+          - `idx_usuario`: índice del usuario en el JSON.
+          - `tipo_servicio`: por ejemplo `consultas`, `procedimientos`, etc.
+          - `idx_item`: posición del servicio dentro de la lista de ese tipo.
+          - `vrServicio_factura`: valor original de la factura (solo referencia).
+          - `vrServicio_nota`: **valor que quieres que tenga la nota** para ese servicio
+            (puede ser positivo o negativo, total o parcial).
+        - Solo se aplican cambios donde `vrServicio_nota` tenga un valor.
+        """
+    )
 
     col_descarga, col_subida = st.columns(2)
 
     with col_descarga:
-        buffer_excel, ext, mime = generar_excel_servicios(nota_data)
+        buffer, ext, mime = generar_plantilla_servicios(nota_data, factura_data)
         st.download_button(
-            "⬇️ Descargar plantilla (Excel si hay motor, si no CSV)",
-            data=buffer_excel,
+            "⬇️ Descargar plantilla de servicios (Excel si es posible, si no CSV)",
+            data=buffer,
             file_name=f"plantilla_servicios_rips.{ext}",
             mime=mime,
         )
 
     with col_subida:
-        if excel_file is not None:
-            if st.button("Aplicar cambios desde archivo cargado"):
-                nota_actualizada, errores = aplicar_excel_servicios(nota_data, excel_file)
+        if plantilla_file is not None:
+            if st.button("Aplicar cambios desde plantilla"):
+                nota_actualizada, errores = aplicar_plantilla_servicios(
+                    nota_data, factura_data, plantilla_file
+                )
                 st.session_state["nota_data"] = nota_actualizada
                 nota_data = nota_actualizada
                 if errores:
@@ -509,7 +620,7 @@ def main():
                     for e in errores:
                         st.write(f"- {e}")
                 else:
-                    st.success("Cambios masivos aplicados correctamente desde el archivo.")
+                    st.success("Cambios masivos aplicados correctamente desde la plantilla.")
 
     # 6. Descarga final
     st.markdown("---")
