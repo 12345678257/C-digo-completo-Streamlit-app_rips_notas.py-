@@ -47,11 +47,6 @@ def copiar_servicios_factura_a_nota(
     """
     Copia el bloque 'servicios' de la factura a la nota crédito.
     Busca cada usuario por tipo/numero de documento y, si falla, solo por número de documento.
-
-    forzar_signo:
-        None  -> deja los valores tal cual están en la factura.
-        +1    -> fuerza a que queden positivos.
-        -1    -> fuerza a que queden negativos.
     """
     inv_users = factura.get("usuarios", [])
     note_users = nota.get("usuarios", [])
@@ -79,7 +74,6 @@ def copiar_servicios_factura_a_nota(
 
         servicios_actuales = u.get("servicios")
 
-        # ¿Ya tiene listas con ítems?
         if tiene_lista_con_items(servicios_actuales):
             ya_tenian_servicios += 1
             continue
@@ -108,10 +102,6 @@ def copiar_servicios_factura_a_nota(
 
 
 def validar_estructura_servicios(nota: Dict[str, Any]) -> List[int]:
-    """
-    Devuelve la lista de índices de usuarios cuya estructura 'servicios'
-    NO cumple con 'al menos una lista con 1 item'.
-    """
     malos: List[int] = []
     for i, u in enumerate(nota.get("usuarios", [])):
         if not tiene_lista_con_items(u.get("servicios")):
@@ -145,13 +135,14 @@ def generar_resumen_usuarios(nota: Dict[str, Any]) -> pd.DataFrame:
 
 
 # ==========================
-# Excel masivo
+# Excel / CSV masivo
 # ==========================
 
-def generar_excel_servicios(nota: Dict[str, Any]) -> BytesIO:
+def generar_excel_servicios(nota: Dict[str, Any]) -> Tuple[BytesIO, str, str]:
     """
-    Genera un Excel con una fila por usuario y una columna 'servicios_json'
-    que contiene el JSON de los servicios para edición masiva.
+    Genera plantilla para edición masiva.
+    Si hay motor de Excel disponible, genera .xlsx; si no, genera .csv.
+    Retorna (buffer, extension, mime_type).
     """
     filas: List[Dict[str, Any]] = []
     for idx, u in enumerate(nota.get("usuarios", [])):
@@ -165,27 +156,42 @@ def generar_excel_servicios(nota: Dict[str, Any]) -> BytesIO:
         )
     df = pd.DataFrame(filas)
     buffer = BytesIO()
-    # 👇 Aquí el cambio: usamos openpyxl para escribir el .xlsx
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="servicios")
+    ext = "xlsx"
+    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    try:
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="servicios")
+    except (ModuleNotFoundError, ImportError):
+        # Fallback a CSV para evitar errores cuando no hay motor de Excel
+        buffer = BytesIO()
+        df.to_csv(buffer, index=False)
+        ext = "csv"
+        mime = "text/csv"
+
     buffer.seek(0)
-    return buffer
+    return buffer, ext, mime
 
 
 def aplicar_excel_servicios(nota: Dict[str, Any], archivo_excel) -> Tuple[Dict[str, Any], List[str]]:
     """
-    Aplica los cambios de servicios contenidos en un Excel.
+    Aplica los cambios de servicios contenidos en un archivo de plantilla.
+    Soporta .xlsx (si hay motor instalado) y .csv.
     Espera las columnas: index, servicios_json.
     """
     errores: List[str] = []
     try:
-        df = pd.read_excel(archivo_excel)
+        nombre = getattr(archivo_excel, "name", "") or ""
+        if nombre.lower().endswith(".csv"):
+            df = pd.read_csv(archivo_excel)
+        else:
+            df = pd.read_excel(archivo_excel)
     except Exception as exc:
-        errores.append(f"No se pudo leer el Excel: {exc}")
+        errores.append(f"No se pudo leer el archivo (xlsx/csv): {exc}")
         return nota, errores
 
     if "index" not in df.columns or "servicios_json" not in df.columns:
-        errores.append("El Excel debe contener las columnas 'index' y 'servicios_json'.")
+        errores.append("El archivo debe contener las columnas 'index' y 'servicios_json'.")
         return nota, errores
 
     usuarios = nota.get("usuarios", [])
@@ -203,7 +209,6 @@ def aplicar_excel_servicios(nota: Dict[str, Any], archivo_excel) -> Tuple[Dict[s
 
         servicios_str = fila.get("servicios_json")
         if pd.isna(servicios_str):
-            # Nada que actualizar para este usuario
             continue
 
         try:
@@ -219,15 +224,10 @@ def aplicar_excel_servicios(nota: Dict[str, Any], archivo_excel) -> Tuple[Dict[s
 
 
 # ==========================
-# JSON -> XML (estructura genérica)
+# JSON -> XML (genérico)
 # ==========================
 
 def nota_json_a_xml_element(nota: Dict[str, Any]) -> ET.Element:
-    """
-    Convierte la nota/factura JSON en un XML genérico de trabajo.
-    NO es un XML oficial DIAN, es una representación estructurada
-    para efectos de consulta y descarga.
-    """
     root = ET.Element("RipsDocumento")
     for key, val in nota.items():
         if key == "usuarios":
@@ -275,7 +275,6 @@ def cargar_json_en_estado(uploaded_file, state_key: str, name_key: str) -> None:
     nombre_subido = uploaded_file.name
     nombre_actual = st.session_state.get(name_key)
     if nombre_actual == nombre_subido and state_key in st.session_state:
-        # Ya lo tenemos cargado
         return
     try:
         data = json.load(uploaded_file)
@@ -304,10 +303,9 @@ def main():
     st.write(
         "Cargue la **factura (JSON completo)** y la **nota/crédito o archivo RIPS incompleto** en JSON. "
         "La aplicación le permitirá copiar los servicios faltantes, editar manualmente, "
-        "hacer ajustes masivos por Excel y descargar el resultado en JSON y XML."
+        "hacer ajustes masivos por Excel/CSV y descargar el resultado en JSON y XML."
     )
 
-    # ---- Sidebar: carga de archivos ----
     st.sidebar.header("1️⃣ Cargar archivos")
 
     factura_file = st.sidebar.file_uploader(
@@ -317,7 +315,9 @@ def main():
         "JSON a corregir (Nota crédito / RIPS)", type=["json"], key="nota_uploader"
     )
     excel_file = st.sidebar.file_uploader(
-        "Plantilla Excel con servicios actualizados (opcional)", type=["xlsx"], key="excel_uploader"
+        "Plantilla con servicios actualizados (xlsx o csv, opcional)",
+        type=["xlsx", "csv"],
+        key="excel_uploader",
     )
 
     if "factura_data" not in st.session_state:
@@ -327,7 +327,6 @@ def main():
         st.session_state["nota_data"] = None
         st.session_state["nota_name"] = None
 
-    # Cargar JSONs en sesión
     cargar_json_en_estado(factura_file, "factura_data", "factura_name")
     cargar_json_en_estado(nota_file, "nota_data", "nota_name")
 
@@ -371,7 +370,7 @@ def main():
     if not nota_data:
         st.stop()
 
-    # ---- Resumen de usuarios / validación ----
+    # 2. Resumen usuarios
     st.markdown("---")
     st.subheader("2️⃣ Resumen y validación de usuarios")
 
@@ -395,12 +394,12 @@ def main():
                     "Puede rellenarlos automáticamente desde la factura o editar manualmente."
                 )
 
-    # ---- Copiar servicios desde la factura ----
+    # 3. Copiar servicios desde factura
     st.markdown("---")
     st.subheader("3️⃣ Rellenar servicios desde JSON de referencia")
 
     if not factura_data:
-        st.info("Para poder copiar servicios automáticamente, cargue primero el JSON de la factura en la barra lateral.")
+        st.info("Para copiar servicios automáticamente, cargue primero el JSON de la factura.")
     else:
         col_signo, col_boton = st.columns([2, 1])
         with col_signo:
@@ -424,7 +423,7 @@ def main():
                     factura_data, nota_trabajo, signo
                 )
                 st.session_state["nota_data"] = nota_actualizada
-                nota_data = nota_actualizada  # actualizar referencia local
+                nota_data = nota_actualizada
                 st.success(
                     f"Servicios copiados. Usuarios modificados: {resumen['usuarios_modificados']}, "
                     f"ya tenían servicios: {resumen['usuarios_ya_tenian_servicios']}, "
@@ -440,10 +439,9 @@ def main():
                 else:
                     st.success("Todos los usuarios cumplen la estructura mínima de servicios.")
 
-                # Recalcular resumen
                 df_resumen = generar_resumen_usuarios(nota_data)
 
-    # ---- Edición individual ----
+    # 4. Edición individual
     st.markdown("---")
     st.subheader("4️⃣ Edición individual de servicios")
 
@@ -485,24 +483,24 @@ def main():
                 st.session_state["nota_data"] = nota_data
                 st.success("Servicios actualizados correctamente para este usuario.")
 
-    # ---- Edición masiva por Excel ----
+    # 5. Masivo Excel / CSV
     st.markdown("---")
-    st.subheader("5️⃣ Edición masiva por Excel")
+    st.subheader("5️⃣ Edición masiva por Excel/CSV")
 
     col_descarga, col_subida = st.columns(2)
 
     with col_descarga:
-        buffer_excel = generar_excel_servicios(nota_data)
+        buffer_excel, ext, mime = generar_excel_servicios(nota_data)
         st.download_button(
-            "⬇️ Descargar plantilla Excel desde la nota actual",
+            "⬇️ Descargar plantilla (Excel si hay motor, si no CSV)",
             data=buffer_excel,
-            file_name="plantilla_servicios_rips.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            file_name=f"plantilla_servicios_rips.{ext}",
+            mime=mime,
         )
 
     with col_subida:
         if excel_file is not None:
-            if st.button("Aplicar cambios desde Excel cargado"):
+            if st.button("Aplicar cambios desde archivo cargado"):
                 nota_actualizada, errores = aplicar_excel_servicios(nota_data, excel_file)
                 st.session_state["nota_data"] = nota_actualizada
                 nota_data = nota_actualizada
@@ -511,9 +509,9 @@ def main():
                     for e in errores:
                         st.write(f"- {e}")
                 else:
-                    st.success("Cambios masivos aplicados correctamente desde el Excel.")
+                    st.success("Cambios masivos aplicados correctamente desde el archivo.")
 
-    # ---- Descarga de resultados ----
+    # 6. Descarga final
     st.markdown("---")
     st.subheader("6️⃣ Descargar JSON y XML resultantes")
 
