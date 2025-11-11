@@ -111,6 +111,40 @@ def validar_estructura_servicios(nota: Dict[str, Any]) -> List[int]:
     return malos
 
 
+def generar_resumen_usuarios(nota: Dict[str, Any]) -> pd.DataFrame:
+    """
+    Tabla resumen por usuario:
+    - idx
+    - tipoDocumentoIdentificacion
+    - numDocumentoIdentificacion
+    - estadoServicios (OK / INCOMPLETO)
+    - numListasServicios
+    - totalItemsServicios
+    """
+    filas: List[Dict[str, Any]] = []
+    for idx, u in enumerate(nota.get("usuarios", [])):
+        servicios = u.get("servicios", {})
+        tiene_serv = tiene_lista_con_items(servicios)
+        num_listas = 0
+        total_items = 0
+        if isinstance(servicios, dict):
+            for v in servicios.values():
+                if isinstance(v, list):
+                    num_listas += 1
+                    total_items += len(v)
+        filas.append(
+            {
+                "idx": idx,
+                "tipoDocumentoIdentificacion": u.get("tipoDocumentoIdentificacion"),
+                "numDocumentoIdentificacion": u.get("numDocumentoIdentificacion"),
+                "estadoServicios": "OK" if tiene_serv else "INCOMPLETO",
+                "numListasServicios": num_listas,
+                "totalItemsServicios": total_items,
+            }
+        )
+    return pd.DataFrame(filas)
+
+
 # ==========================
 # Claves esperadas y desglose
 # ==========================
@@ -395,6 +429,10 @@ def aplicar_plantilla_servicios(
 # ==========================
 
 def nota_json_a_xml_element(nota: Dict[str, Any]) -> ET.Element:
+    """
+    XML genérico para visualizar/exportar el contenido del JSON.
+    No es un XML oficial DIAN ni Minsalud, solo una representación estructurada.
+    """
     root = ET.Element("RipsDocumento")
     for key, val in nota.items():
         if key == "usuarios":
