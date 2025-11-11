@@ -46,7 +46,8 @@ def copiar_servicios_factura_a_nota(
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
     Copia el bloque 'servicios' de la factura a la nota crédito.
-    Busca cada usuario por tipo/numero de documento y, si falla, solo por número de documento.
+    Busca cada usuario por índice (asumiendo misma población) y/o por tipo/numero de documento,
+    y solo si en la nota ese usuario no tiene ninguna lista de servicios con ítems.
     """
     inv_users = factura.get("usuarios", [])
     note_users = nota.get("usuarios", [])
@@ -102,6 +103,10 @@ def copiar_servicios_factura_a_nota(
 
 
 def validar_estructura_servicios(nota: Dict[str, Any]) -> List[int]:
+    """
+    Devuelve la lista de índices de usuarios cuya estructura 'servicios'
+    NO cumple con 'al menos una lista con 1 item'.
+    """
     malos: List[int] = []
     for i, u in enumerate(nota.get("usuarios", [])):
         if not tiene_lista_con_items(u.get("servicios")):
@@ -135,59 +140,142 @@ def generar_resumen_usuarios(nota: Dict[str, Any]) -> pd.DataFrame:
 
 
 # ==========================
-# Plantilla masiva por servicio
+# Claves esperadas y desglose
 # ==========================
 
-def _extraer_filas_servicios(base_doc: Dict[str, Any]) -> List[Dict[str, Any]]:
+def obtener_claves_servicio_esperadas(
+    factura: Optional[Dict[str, Any]],
+    nota: Optional[Dict[str, Any]],
+) -> List[str]:
     """
-    Convierte la estructura JSON en filas planas, una fila por servicio:
-    - idx_usuario, tipo_servicio, idx_item
-    - identificacion del usuario
-    - datos básicos del servicio
-    - vrServicio_factura (referencia) y vrServicio_nota (a diligenciar)
+    Obtiene el conjunto de claves esperadas para un item de servicio
+    tomando la unión de todos los servicios de la factura y la nota.
+    """
+    keys: set = set()
+    for doc in (factura, nota):
+        if not doc:
+            continue
+        for u in doc.get("usuarios", []):
+            servicios = u.get("servicios", {})
+            if not isinstance(servicios, dict):
+                continue
+            for lista in servicios.values():
+                if not isinstance(lista, list):
+                    continue
+                for item in lista:
+                    if isinstance(item, dict):
+                        keys.update(item.keys())
+    return sorted(keys)
+
+
+def desglosar_servicios_usuario(
+    usuario: Dict[str, Any],
+    claves_esperadas: List[str],
+) -> List[Dict[str, Any]]:
+    """
+    Convierte los servicios de un usuario en filas planas, una por item,
+    incluyendo qué campos están vacíos o en None.
     """
     filas: List[Dict[str, Any]] = []
-    for idx_u, u in enumerate(base_doc.get("usuarios", [])):
-        servicios = u.get("servicios") or {}
-        if not isinstance(servicios, dict) or not servicios:
+    servicios = usuario.get("servicios") or {}
+    if not isinstance(servicios, dict):
+        return filas
+
+    for tipo_servicio, lista in servicios.items():
+        if not isinstance(lista, list):
             continue
-        for tipo_serv, lista in servicios.items():
-            if not isinstance(lista, list):
-                continue
-            for idx_item, item in enumerate(lista):
-                filas.append(
-                    {
-                        "idx_usuario": idx_u,
-                        "tipoDocumentoIdentificacion": u.get("tipoDocumentoIdentificacion"),
-                        "numDocumentoIdentificacion": u.get("numDocumentoIdentificacion"),
-                        "tipo_servicio": tipo_serv,
-                        "idx_item": idx_item,
-                        "codPrestador": item.get("codPrestador"),
-                        "fechaInicioAtencion": item.get("fechaInicioAtencion"),
-                        "codConsulta": item.get("codConsulta"),
-                        "codServicio": item.get("codServicio"),
-                        "vrServicio_factura": item.get("vrServicio"),
-                        "vrServicio_nota": None,
-                        "valorPagoModerador": item.get("valorPagoModerador"),
-                    }
-                )
+        for idx_item, item in enumerate(lista):
+            fila: Dict[str, Any] = {
+                "tipo_servicio": tipo_servicio,
+                "idx_item": idx_item,
+            }
+            faltantes: List[str] = []
+            for clave in claves_esperadas:
+                valor = item.get(clave)
+                fila[clave] = valor
+                if valor in (None, ""):
+                    faltantes.append(clave)
+            fila["campos_faltantes"] = ",".join(faltantes)
+            filas.append(fila)
+
     return filas
 
 
-def generar_plantilla_servicios(nota: Dict[str, Any], factura: Optional[Dict[str, Any]]) -> Tuple[BytesIO, str, str]:
+# ==========================
+# Plantilla masiva por servicio
+# ==========================
+
+def generar_plantilla_servicios(
+    nota: Dict[str, Any],
+    factura: Optional[Dict[str, Any]],
+) -> Tuple[BytesIO, str, str]:
     """
-    Genera plantilla para edición masiva de servicios.
-    Si hay factura, usa la factura como base (valores reales de la prestación).
-    Si no hay factura, usa la nota actual.
+    Genera plantilla para edición masiva de servicios, centrada en la NOTA.
+    - Cada fila = 1 servicio de 1 usuario de la nota.
+    - vrServicio_nota se llena con el valor actual de la nota.
+    - Si hay factura, se trae vrServicio_factura como referencia (mismo idx_usuario/tipo_servicio/idx_item).
+    - Si en la nota un usuario no tiene estructura de servicios pero sí existe en la factura,
+      se generan filas vacías para ese usuario usando la factura como base.
     Retorna (buffer, extension, mime_type).
     """
-    base_doc = factura if factura is not None else nota
-    filas = _extraer_filas_servicios(base_doc)
+    claves_esperadas = obtener_claves_servicio_esperadas(factura, nota)
+    filas: List[Dict[str, Any]] = []
+
+    usuarios_nota = nota.get("usuarios", []) or []
+    usuarios_fac = factura.get("usuarios", []) if factura else []
+
+    for idx_u in range(len(usuarios_nota)):
+        u_nota = usuarios_nota[idx_u]
+        u_fac = usuarios_fac[idx_u] if 0 <= idx_u < len(usuarios_fac) else None
+
+        # Desglose de servicios para el usuario en la nota y en la factura
+        filas_nota = desglosar_servicios_usuario(u_nota, claves_esperadas)
+        filas_fac = desglosar_servicios_usuario(u_fac, claves_esperadas) if u_fac else []
+
+        # Mapa de referencia por (tipo_servicio, idx_item) en factura
+        map_fac: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        for f in filas_fac:
+            key = (f["tipo_servicio"], f["idx_item"])
+            map_fac[key] = f
+
+        if filas_nota:
+            # El usuario ya tiene estructura de servicios en la nota
+            for f in filas_nota:
+                key = (f["tipo_servicio"], f["idx_item"])
+                base_fac = map_fac.get(key, {})
+                fila = {
+                    "idx_usuario": idx_u,
+                    "tipoDocumentoIdentificacion": u_nota.get("tipoDocumentoIdentificacion"),
+                    "numDocumentoIdentificacion": u_nota.get("numDocumentoIdentificacion"),
+                    "tipo_servicio": f["tipo_servicio"],
+                    "idx_item": f["idx_item"],
+                    "vrServicio_factura": base_fac.get("vrServicio") if base_fac else None,
+                    "vrServicio_nota": f.get("vrServicio"),
+                    "campos_faltantes_nota": f.get("campos_faltantes", ""),
+                }
+                filas.append(fila)
+        else:
+            # El usuario NO tiene servicios en la nota. Si existe en factura, generamos
+            # filas base para que en la plantilla puedas definir vrServicio_nota.
+            for f in filas_fac:
+                fila = {
+                    "idx_usuario": idx_u,
+                    "tipoDocumentoIdentificacion": u_nota.get("tipoDocumentoIdentificacion"),
+                    "numDocumentoIdentificacion": u_nota.get("numDocumentoIdentificacion"),
+                    "tipo_servicio": f["tipo_servicio"],
+                    "idx_item": f["idx_item"],
+                    "vrServicio_factura": f.get("vrServicio"),
+                    "vrServicio_nota": None,
+                    "campos_faltantes_nota": "TODOS (usuario sin estructura de servicios en nota)",
+                }
+                filas.append(fila)
+
     df = pd.DataFrame(filas)
     buffer = BytesIO()
     ext = "xlsx"
     mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
+    # Intentamos Excel; si no hay motor, caemos a CSV para no romper la app
     try:
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="servicios")
@@ -204,22 +292,26 @@ def generar_plantilla_servicios(nota: Dict[str, Any], factura: Optional[Dict[str
 def aplicar_plantilla_servicios(
     nota: Dict[str, Any],
     factura: Optional[Dict[str, Any]],
-    archivo,
+    archivo_plantilla,
 ) -> Tuple[Dict[str, Any], List[str]]:
     """
-    Aplica los cambios de vrServicio_nota contenidos en una plantilla.
-    Si la estructura de servicios no existe en la nota, se toma de la factura.
-    Soporta archivos .xlsx (si hay motor) y .csv.
+    Aplica los cambios de vrServicio_nota contenidos en la plantilla (xlsx o csv).
+    - Si la nota ya tiene la estructura de servicios para esa fila, solo actualiza vrServicio.
+    - Si la nota NO tiene esa estructura pero sí existe en la factura, copia la línea de la factura
+      y luego actualiza vrServicio.
+    - Si no hay factura ni estructura en la nota, deja un error para esa fila.
     """
     errores: List[str] = []
+
+    # Leer plantilla
     try:
-        nombre = getattr(archivo, "name", "") or ""
+        nombre = getattr(archivo_plantilla, "name", "") or ""
         if nombre.lower().endswith(".csv"):
-            df = pd.read_csv(archivo)
+            df = pd.read_csv(archivo_plantilla)
         else:
-            df = pd.read_excel(archivo)
+            df = pd.read_excel(archivo_plantilla)
     except Exception as exc:
-        errores.append(f"No se pudo leer el archivo (xlsx/csv): {exc}")
+        errores.append(f"No se pudo leer el archivo de plantilla (xlsx/csv): {exc}")
         return nota, errores
 
     obligatorias = ["idx_usuario", "tipo_servicio", "idx_item", "vrServicio_nota"]
@@ -246,12 +338,12 @@ def aplicar_plantilla_servicios(
             continue
 
         vr_nota = fila["vrServicio_nota"]
+        # Si no se diligenció vrServicio_nota, no tocamos esa fila
         if pd.isna(vr_nota):
-            # si no diligenciaron nada, no tocamos ese servicio
             continue
 
         if not (0 <= idx_u < len(usuarios_nota)):
-            errores.append(f"Índice de usuario {idx_u} fuera de rango.")
+            errores.append(f"Índice de usuario {idx_u} fuera de rango en la nota.")
             continue
 
         usuario_nota = usuarios_nota[idx_u]
@@ -262,19 +354,21 @@ def aplicar_plantilla_servicios(
 
         lista = servicios_nota.get(tipo_serv)
 
-        # Si la lista o la posición no existen en la nota, intentamos copiarlas desde la factura.
+        # Si la estructura no existe aún en la nota, intentamos copiarla desde la factura
         if not (isinstance(lista, list) and idx_item < len(lista)):
-            if factura is None:
+            if not factura:
                 errores.append(
                     f"No existe estructura de servicios para usuario {idx_u}, "
                     f"tipo '{tipo_serv}', ítem {idx_item} y no hay factura cargada."
                 )
                 continue
+
             if not (0 <= idx_u < len(usuarios_fac)):
                 errores.append(
                     f"No se encontró el usuario {idx_u} en la factura para crear la estructura de servicios."
                 )
                 continue
+
             usuario_fac = usuarios_fac[idx_u]
             servicios_fac = usuario_fac.get("servicios", {})
             lista_fac = servicios_fac.get(tipo_serv)
@@ -285,6 +379,7 @@ def aplicar_plantilla_servicios(
                 )
                 continue
 
+            # Copiamos línea base desde factura
             item_base = copy.deepcopy(lista_fac[idx_item])
             if not isinstance(lista, list):
                 lista = []
@@ -293,7 +388,15 @@ def aplicar_plantilla_servicios(
             lista[idx_item] = item_base
             servicios_nota[tipo_serv] = lista
 
+        # A estas alturas, ya debemos tener una lista en la nota con la posición idx_item
         lista = servicios_nota.get(tipo_serv, [])
+        if not (isinstance(lista, list) and idx_item < len(lista)):
+            errores.append(
+                f"No se pudo asegurar la estructura de servicios para usuario {idx_u}, "
+                f"tipo '{tipo_serv}', ítem {idx_item}."
+            )
+            continue
+
         item_nota = lista[idx_item]
 
         try:
@@ -320,6 +423,10 @@ def aplicar_plantilla_servicios(
 # ==========================
 
 def nota_json_a_xml_element(nota: Dict[str, Any]) -> ET.Element:
+    """
+    XML genérico para visualizar/exportar el contenido del JSON.
+    No es un XML oficial DIAN, solo una representación estructurada.
+    """
     root = ET.Element("RipsDocumento")
     for key, val in nota.items():
         if key == "usuarios":
@@ -362,6 +469,7 @@ def nota_json_a_xml_bytes(nota: Dict[str, Any]) -> bytes:
 # ==========================
 
 def cargar_json_en_estado(uploaded_file, state_key: str, name_key: str) -> None:
+    """Carga un JSON desde un uploader de Streamlit en el session_state."""
     if uploaded_file is None:
         return
     nombre_subido = uploaded_file.name
@@ -398,6 +506,7 @@ def main():
         "hacer ajustes masivos por plantilla (Excel/CSV) y descargar el resultado en JSON y XML."
     )
 
+    # ---- Sidebar: carga de archivos ----
     st.sidebar.header("1️⃣ Cargar archivos")
 
     factura_file = st.sidebar.file_uploader(
@@ -412,6 +521,7 @@ def main():
         key="plantilla_uploader",
     )
 
+    # Inicializar estado
     if "factura_data" not in st.session_state:
         st.session_state["factura_data"] = None
         st.session_state["factura_name"] = None
@@ -419,6 +529,7 @@ def main():
         st.session_state["nota_data"] = None
         st.session_state["nota_name"] = None
 
+    # Cargar JSONs
     cargar_json_en_estado(factura_file, "factura_data", "factura_name")
     cargar_json_en_estado(nota_file, "nota_data", "nota_name")
 
@@ -441,10 +552,10 @@ def main():
                 }
             )
         else:
-            st.info("Suba un JSON de factura completa en la barra lateral.")
+            st.info("Suba un JSON de factura completa en la barra lateral (opcional pero recomendado).")
 
     with col_meta2:
-        st.subheader("🧾 Nota / JSON a corregir")
+        st.subheader("🧾 Nota / JSON a corregir (SE EDITA ESTE)")
         if nota_data:
             st.markdown(f"**Archivo:** `{st.session_state.get('nota_name')}`")
             st.json(
@@ -462,7 +573,10 @@ def main():
     if not nota_data:
         st.stop()
 
-    # 2. Resumen usuarios
+    # Claves esperadas para desgloses y detección de faltantes
+    claves_esperadas = obtener_claves_servicio_esperadas(factura_data, nota_data)
+
+    # ---- Resumen de usuarios / validación ----
     st.markdown("---")
     st.subheader("2️⃣ Resumen y validación de usuarios")
 
@@ -487,12 +601,15 @@ def main():
                     "editar un usuario puntual o usar la plantilla masiva."
                 )
 
-    # 3. Copiar servicios desde factura
+    # ---- Copiar servicios desde la factura ----
     st.markdown("---")
     st.subheader("3️⃣ Rellenar servicios desde JSON de referencia (opcional)")
 
     if not factura_data:
-        st.info("Para copiar servicios automáticamente, cargue primero el JSON de la factura.")
+        st.info(
+            "Para copiar servicios automáticamente en la nota a partir de la factura, "
+            "cargue primero el JSON de la factura en la barra lateral."
+        )
     else:
         col_signo, col_boton = st.columns([2, 1])
         with col_signo:
@@ -534,9 +651,9 @@ def main():
 
                 df_resumen = generar_resumen_usuarios(nota_data)
 
-    # 4. Edición individual
+    # ---- Edición individual ----
     st.markdown("---")
-    st.subheader("4️⃣ Edición individual de servicios (JSON crudo)")
+    st.subheader("4️⃣ Edición individual de servicios del JSON de la NOTA")
 
     usuarios = nota_data.get("usuarios", [])
     if not usuarios:
@@ -556,9 +673,19 @@ def main():
             f"{usuario.get('tipoDocumentoIdentificacion')} {usuario.get('numDocumentoIdentificacion')}"
         )
 
+        # Tabla plana de servicios de este usuario (aunque estén incompletos)
+        filas_usuario = desglosar_servicios_usuario(usuario, claves_esperadas)
+        if filas_usuario:
+            df_usuario = pd.DataFrame(filas_usuario)
+            st.markdown("**Servicios del usuario (vista tabla, campos faltantes en columna final):**")
+            st.dataframe(df_usuario, use_container_width=True, height=260)
+        else:
+            st.info("Este usuario no tiene servicios cargados aún en la nota.")
+
+        # Editor JSON crudo para el bloque 'servicios' de este usuario
         servicios_actuales_str = json.dumps(usuario.get("servicios", {}), ensure_ascii=False, indent=2)
         servicios_editados = st.text_area(
-            "Edite el JSON de `servicios` para este usuario (estructura dict con listas).",
+            "Edite el JSON completo de `servicios` para este usuario (estructura dict con listas).",
             value=servicios_actuales_str,
             height=260,
             key=f"servicios_usuario_{idx_sel}",
@@ -576,7 +703,7 @@ def main():
                 st.session_state["nota_data"] = nota_data
                 st.success("Servicios actualizados correctamente para este usuario.")
 
-    # 5. Masivo con plantilla
+    # ---- Edición masiva con plantilla ----
     st.markdown("---")
     st.subheader("5️⃣ Edición masiva con plantilla (valor de la nota por servicio)")
 
@@ -584,14 +711,16 @@ def main():
         """
         **Cómo funciona la plantilla:**
 
-        - Cada fila representa **un servicio** de un usuario.
+        - Cada fila representa **un servicio** de un usuario según el JSON de la NOTA.
         - Campos clave:
-          - `idx_usuario`: índice del usuario en el JSON.
+          - `idx_usuario`: índice del usuario en la lista `usuarios` de la nota.
           - `tipo_servicio`: por ejemplo `consultas`, `procedimientos`, etc.
           - `idx_item`: posición del servicio dentro de la lista de ese tipo.
-          - `vrServicio_factura`: valor original de la factura (solo referencia).
+          - `vrServicio_factura`: valor original de la factura (solo referencia, si hay JSON de factura cargado).
           - `vrServicio_nota`: **valor que quieres que tenga la nota** para ese servicio
             (puede ser positivo o negativo, total o parcial).
+          - `campos_faltantes_nota`: lista de claves que están vacías/None en la nota para ese servicio,
+            comparando con un usuario "completo".
         - Solo se aplican cambios donde `vrServicio_nota` tenga un valor.
         """
     )
@@ -622,7 +751,7 @@ def main():
                 else:
                     st.success("Cambios masivos aplicados correctamente desde la plantilla.")
 
-    # 6. Descarga final
+    # ---- Descarga de resultados ----
     st.markdown("---")
     st.subheader("6️⃣ Descargar JSON y XML resultantes")
 
@@ -632,7 +761,7 @@ def main():
     col_json, col_xml = st.columns(2)
     with col_json:
         st.download_button(
-            "⬇️ Descargar JSON corregido",
+            "⬇️ Descargar JSON corregido (NOTA)",
             data=nota_json_bytes,
             file_name=f"{nombre_nota_base.rsplit('.', 1)[0]}_corregida.json",
             mime="application/json",
@@ -641,7 +770,7 @@ def main():
     with col_xml:
         xml_bytes = nota_json_a_xml_bytes(nota_data)
         st.download_button(
-            "⬇️ Descargar XML generado desde JSON",
+            "⬇️ Descargar XML generado desde JSON de la nota",
             data=xml_bytes,
             file_name=f"{nombre_nota_base.rsplit('.', 1)[0]}.xml",
             mime="application/xml",
